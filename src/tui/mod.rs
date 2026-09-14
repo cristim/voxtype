@@ -116,7 +116,10 @@ fn event_loop(terminal: &mut Tui, force_package_mode: bool) -> anyhow::Result<bo
             // Idle tick. Refresh the General-screen state (daemon status,
             // active variant, inventory) so the green/red dot stays current
             // without the user pressing `r`.
+            // Paused while the benchmark screen is open: the refresh runs
+            // nvidia-smi and lspci, which would skew the timed runs.
             if app.current_section == Section::General
+                && app.benchmark.is_none()
                 && last_general_refresh.elapsed() >= general_refresh_interval
             {
                 app.refresh_inventory();

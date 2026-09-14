@@ -174,19 +174,25 @@ pub enum SetupAction {
     },
 
     /// Benchmark the installed binary variants on this machine
-    ///
-    /// Records you reading a short passage, transcribes it with every
-    /// installed variant that can run here, and recommends the fastest one
-    /// that got the words right. Nothing is switched. Examples:
-    ///
-    ///   voxtype setup benchmark
-    ///   voxtype setup benchmark --audio recording.wav --runs 5
+    #[command(long_about = "\
+Benchmark the installed binary variants on this machine.
+
+Records you reading a short passage, transcribes it with every installed
+variant that can run here, and recommends the fastest one that got the words
+right. A variant that is already slower than an accurate one is stopped early.
+Results are saved and shown by `voxtype configure` and `voxtype info
+variants`. Nothing is switched.
+
+Examples:
+  voxtype setup benchmark
+  voxtype setup benchmark --runs 5
+  voxtype setup benchmark --audio recording.wav --json")]
     Benchmark {
         /// Benchmark an existing WAV file instead of recording (accuracy is not scored)
         #[arg(long, value_name = "FILE")]
         audio: Option<std::path::PathBuf>,
 
-        /// Timed runs per variant, after one warm-up run
+        /// Timed runs per variant, after one warm-up run (at least 1)
         #[arg(long, default_value_t = 3, value_name = "N")]
         runs: usize,
 

@@ -8,7 +8,7 @@
 
 use crate::setup::benchmark::{self, BenchEvent, BenchmarkInput, Report};
 use crate::setup::binary::{self, InstallKind, Variant};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -16,7 +16,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +29,11 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum Message {
     Event(BenchEvent),
-    Done(Result<Report, String>),
+    Done {
+        result: Result<Report, String>,
+        /// `None` when there was nothing worth saving (no recommendation).
+        saved: Option<Result<(), String>>,
+    },
 }
 
 pub enum Phase {
@@ -50,6 +53,7 @@ pub enum Phase {
     },
     Done {
         report: Report,
+        saved: Option<Result<(), String>>,
     },
     Failed(String),
 }
@@ -133,10 +137,10 @@ impl BenchmarkScreen {
     fn stop_recording(&mut self) {
         if let Phase::Recording { mut child, .. } = std::mem::replace(&mut self.phase, Phase::Intro)
         {
-            // The recorder stops on a newline; dropping stdin closes it too.
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(b"\n");
-            }
+            // Closing stdin stops the recorder, which treats end of file like a
+            // newline. Writing to it instead would raise SIGPIPE and kill the
+            // TUI if the recorder had already exited.
+            drop(child.stdin.take());
             self.phase = Phase::Stopping {
                 child,
                 deadline: Instant::now() + STOP_TIMEOUT,
@@ -195,18 +199,18 @@ impl BenchmarkScreen {
                     for message in messages {
                         match message {
                             Message::Event(event) => log.push(event.describe()),
-                            Message::Done(result) => outcome = Some(result),
+                            Message::Done { result, saved } => outcome = Some((result, saved)),
                         }
                     }
                 }
                 match outcome {
-                    Some(Ok(report)) => {
-                        self.phase = Phase::Done {
-                            report: report.clone(),
-                        };
-                        Some(report)
+                    Some((Ok(report), saved)) => {
+                        // Only a saved report may replace what General shows.
+                        let shown = matches!(saved, Some(Ok(()))).then(|| report.clone());
+                        self.phase = Phase::Done { report, saved };
+                        shown
                     }
-                    Some(Err(e)) => {
+                    Some((Err(e), _)) => {
                         self.phase = Phase::Failed(e);
                         None
                     }
@@ -256,18 +260,27 @@ impl BenchmarkScreen {
             // The thread owns the recording so it outlives a closed screen.
             let _file = file;
             let events = tx.clone();
-            let result = benchmark::run_benchmark(
-                &input,
-                &mut |event| {
-                    let _ = events.send(Message::Event(event));
-                },
-                &thread_cancel,
-            )
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                benchmark::run_benchmark(
+                    &input,
+                    &mut |event| {
+                        let _ = events.send(Message::Event(event));
+                    },
+                    &thread_cancel,
+                )
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("The benchmark crashed unexpectedly.")))
             .map_err(|e| e.to_string());
-            if let Ok(report) = &result {
-                let _ = benchmark::save_report(report);
-            }
-            let _ = tx.send(Message::Done(result));
+            // A run without a recommendation must not replace earlier results.
+            let saved = match &result {
+                Ok(report) if report.recommended.is_some() => Some(
+                    benchmark::save_report(report)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                ),
+                _ => None,
+            };
+            let _ = tx.send(Message::Done { result, saved });
         });
         self.phase = Phase::Benchmarking {
             rx,
@@ -307,7 +320,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     let Some(screen) = app.benchmark.as_mut() else {
         return Action::None;
     };
+    let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        _ if ctrl_c => {
+            app.benchmark = None;
+            Action::None
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.benchmark = None;
             Action::None
@@ -321,7 +339,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
                 screen.stop_recording();
                 Action::None
             }
-            Phase::Done { report } => match switch_target(report, &app.inventory) {
+            Phase::Done { report, .. } => match switch_target(report, &app.inventory) {
                 Some(variant) => {
                     app.benchmark = None;
                     Action::SwitchVariant(variant)
@@ -422,14 +440,24 @@ pub fn render(f: &mut Frame, screen: &BenchmarkScreen, app: &App) {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("Esc cancel", keys)));
         }
-        Phase::Done { report } => {
+        Phase::Done { report, saved } => {
             for line in benchmark::report_lines(report) {
                 lines.push(Line::from(line));
             }
-            lines.push(Line::from(Span::styled(
-                "Saved. The General screen now stars the measured pick.",
-                dim,
-            )));
+            lines.push(match saved {
+                Some(Ok(())) => Line::from(Span::styled(
+                    "Saved. The General screen now stars the measured pick.",
+                    dim,
+                )),
+                Some(Err(e)) => Line::from(Span::styled(
+                    format!("Could not save the results: {}", e),
+                    warn,
+                )),
+                None => Line::from(Span::styled(
+                    "Nothing was saved, so any earlier results are kept.",
+                    dim,
+                )),
+            });
             lines.push(Line::from(""));
             let hint = match switch_target(report, &app.inventory) {
                 Some(v) => format!("Enter switch to {} · Esc close", v.display()),
@@ -490,6 +518,7 @@ mod tests {
                 recommended: Some(recommended),
                 warnings: Vec::new(),
             },
+            saved: Some(Ok(())),
         }
     }
 
@@ -518,6 +547,44 @@ mod tests {
             Action::None
         ));
         assert!(app.benchmark.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_closes_the_screen() {
+        let mut app = App::new(false);
+        app.benchmark = Some(screen(Phase::Intro));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(matches!(handle_key(&mut app, ctrl_c), Action::None));
+        assert!(app.benchmark.is_none());
+    }
+
+    /// A report that failed to save, or was not worth saving, must not move
+    /// the General screen's star: the next refresh would drop it again.
+    #[test]
+    fn only_a_saved_report_reaches_the_general_screen() {
+        let Phase::Done { report, .. } = done(Variant::WhisperVulkan) else {
+            unreachable!()
+        };
+        let cases = [
+            (Some(Ok(())), true),
+            (Some(Err("disk full".to_string())), false),
+            (None, false),
+        ];
+        for (saved, shown) in cases {
+            let (tx, rx) = mpsc::channel();
+            let mut s = screen(Phase::Benchmarking {
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                log: Vec::new(),
+            });
+            tx.send(Message::Done {
+                result: Ok(report.clone()),
+                saved: saved.clone(),
+            })
+            .unwrap();
+            assert_eq!(s.poll().is_some(), shown);
+            assert!(matches!(&s.phase, Phase::Done { saved: got, .. } if *got == saved));
+        }
     }
 
     #[test]

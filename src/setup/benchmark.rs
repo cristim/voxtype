@@ -11,14 +11,17 @@
 //! build silently failing, say) is not the one recommended, and a variant that
 //! is already slower than an accurate one is stopped rather than waited for.
 
-use super::binary::{self, Variant, LIB_DIR};
+use super::binary::{self, Acceleration, Variant, LIB_DIR};
 use crate::config::{AudioConfig, Config};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Text the user reads aloud. Plain words with no names or numbers, so the
@@ -32,10 +35,17 @@ recommended.";
 /// be recommended for being faster.
 const WER_TOLERANCE: f64 = 0.05;
 
-/// A run is stopped once it is this much slower than the fastest accurate run
-/// of another variant. The slack keeps near-ties from being cut off by noise.
+/// Once its model has loaded, a run is stopped when its transcription takes
+/// this much longer than the typical transcription of the fastest accurate
+/// other variant. The slack keeps near-ties from being cut off by noise.
 const STOP_RATIO: f64 = 1.10;
 const STOP_SLACK_SECS: f64 = 0.25;
+
+/// Before a run reports its model loaded (or for an engine that never does),
+/// it may take this much longer than the pace variant's whole run: model load
+/// times differ widely between CPU and GPU builds.
+const LOAD_RATIO: f64 = 3.0;
+const LOAD_SLACK_SECS: f64 = 2.0;
 
 /// Below this RMS the recording is treated as silence (roughly -46 dBFS).
 pub const MIN_RMS: f32 = 0.005;
@@ -46,6 +56,10 @@ pub const DEFAULT_RUNS: usize = 3;
 const SAMPLE_RATE: u32 = 16_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const REPORT_FILE: &str = "benchmark.json";
+
+/// Log lines `voxtype transcribe` prints, which carry its timings.
+const MODEL_LOADED: &str = "Model loaded in ";
+const TRANSCRIBED: &str = "Transcription completed in ";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TranscribeOutput {
@@ -62,8 +76,11 @@ pub struct VariantResult {
     pub runs_secs: Vec<f64>,
     pub median_secs: Option<f64>,
     pub model_load_secs: Option<f64>,
-    /// Process wall time of every completed run, warm-up included. Sets the
+    /// Transcription time of every completed run, warm-up included. Sets the
     /// pace other variants are stopped against.
+    #[serde(default)]
+    pub observed_secs: Vec<f64>,
+    /// Process wall time of every completed run, warm-up included.
     #[serde(default)]
     pub wall_secs: Vec<f64>,
     /// `None` when no reference text was available to score against.
@@ -83,6 +100,7 @@ impl VariantResult {
             runs_secs: Vec::new(),
             median_secs: None,
             model_load_secs: None,
+            observed_secs: Vec::new(),
             wall_secs: Vec::new(),
             word_error_rate: None,
             transcript: None,
@@ -217,6 +235,7 @@ pub async fn run(
         return Ok(());
     }
 
+    anyhow::ensure!(runs > 0, "--runs must be at least 1");
     let engine = config.engine.name();
     let candidates = candidates(engine);
     if candidates.is_empty() {
@@ -239,7 +258,7 @@ pub async fn run(
             say(json, "Read this passage aloud:\n");
             say(json, &format!("  {}\n", PASSAGE));
             say(json, "Press Enter to start recording.");
-            wait_for_enter().await?;
+            wait_for_enter().await;
             say(
                 json,
                 "Recording. Press Enter when you have finished reading.",
@@ -286,7 +305,8 @@ pub async fn run(
         &mut |event| say(json, &format!("  {}", event.describe())),
         &cancel,
     )?;
-    let saved = save_report(&report);
+    // A run without a recommendation must not replace earlier good results.
+    let saved = report.recommended.map(|_| save_report(&report));
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -307,14 +327,18 @@ pub async fn run(
         }
     }
     match saved {
-        Ok(path) => say(
+        Some(Ok(path)) => say(
             json,
             &format!(
                 "\nSaved to {}. `voxtype configure` and `voxtype info variants` show these results.",
                 path.display()
             ),
         ),
-        Err(e) => say(json, &format!("\nCould not save the results: {}", e)),
+        Some(Err(e)) => say(json, &format!("\nCould not save the results: {}", e)),
+        None => say(
+            json,
+            "\nNothing was saved, so any earlier results are kept.",
+        ),
     }
     Ok(())
 }
@@ -371,6 +395,7 @@ pub fn run_benchmark(
     on_event: &mut dyn FnMut(BenchEvent),
     cancel: &AtomicBool,
 ) -> anyhow::Result<Report> {
+    anyhow::ensure!(input.runs > 0, "At least one timed run is needed");
     let audio_secs = wav_duration_secs(&input.wav)?;
     let warnings = warnings();
     let mut results: Vec<VariantResult> = input
@@ -440,13 +465,19 @@ fn run_once(
     cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
     let variant = results[i].variant;
-    let budget = stop_budget(results, variant);
+    // Warm-up absorbs one-time costs such as GPU shader and kernel compilation,
+    // so only builds without them can be stopped during it.
+    let pace = if timed || !compiles_on_first_run(variant) {
+        pace_for(results, variant)
+    } else {
+        None
+    };
     let outcome = run_variant(
         &input.lib_dir,
         variant,
         &input.wav,
         input.config_path.as_deref(),
-        budget.map(|(_, secs)| secs),
+        pace,
         cancel,
     );
 
@@ -454,6 +485,7 @@ fn run_once(
         RunOutcome::Done(output, wall) => {
             let result = &mut results[i];
             let secs = output.transcribe_secs.unwrap_or(wall);
+            result.observed_secs.push(secs);
             result.wall_secs.push(wall);
             if timed {
                 result.runs_secs.push(secs);
@@ -469,8 +501,8 @@ fn run_once(
             on_event(BenchEvent::Finished { variant, secs });
         }
         RunOutcome::Stopped(after_secs) => {
-            // Only reachable with a budget, which names the faster variant.
-            let faster = budget.map_or(variant, |(v, _)| v);
+            // Only reachable with a pace, which names the faster variant.
+            let faster = pace.map_or(variant, |p| p.variant);
             results[i].stopped = Some(format!(
                 "stopped after {:.1}s, slower than {}",
                 after_secs,
@@ -498,14 +530,14 @@ enum RunOutcome {
     Cancelled,
 }
 
-/// Run one variant's `transcribe` on `wav`. The process is killed once it runs
-/// past `stop_after` seconds, or when `cancel` is set.
+/// Run one variant's `transcribe` on `wav`. The run is killed once it falls
+/// behind `pace`, or when `cancel` is set.
 fn run_variant(
     lib_dir: &Path,
     variant: Variant,
     wav: &Path,
     config_path: Option<&Path>,
-    stop_after: Option<f64>,
+    pace: Option<Pace>,
     cancel: &AtomicBool,
 ) -> RunOutcome {
     let binary = lib_dir.join(variant.binary_name());
@@ -517,7 +549,10 @@ fn run_variant(
         .arg(wav)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Its own process group, so stopping it also stops any helper it
+        // started, such as the GPU-isolation worker.
+        .process_group(0);
 
     let start = Instant::now();
     let mut child = match cmd.spawn() {
@@ -526,7 +561,8 @@ fn run_variant(
     };
     // Drain both pipes on their own threads so a chatty child cannot block on
     // a full pipe while it is being waited for.
-    let stdout = spawn_reader(child.stdout.take());
+    let loaded = Arc::new(OnceLock::new());
+    let stdout = spawn_stdout_reader(child.stdout.take(), loaded.clone());
     let stderr = spawn_reader(child.stderr.take());
 
     let status = loop {
@@ -534,21 +570,26 @@ fn run_variant(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_run(&mut child);
                 return RunOutcome::Failed(format!("waiting for {}: {}", binary.display(), e));
             }
         }
         let elapsed = start.elapsed().as_secs_f64();
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_run(&mut child);
             return RunOutcome::Cancelled;
         }
-        if stop_after.is_some_and(|limit| elapsed > limit) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return RunOutcome::Stopped(elapsed);
+        if let Some(pace) = pace {
+            // Time the transcription itself once the model has loaded, so a
+            // build that loads slowly but transcribes faster is not cut off.
+            let behind = match loaded.get() {
+                Some(at) => at.elapsed().as_secs_f64() > pace.transcribe_secs,
+                None => elapsed > pace.wall_secs,
+            };
+            if behind {
+                kill_run(&mut child);
+                return RunOutcome::Stopped(elapsed);
+            }
         }
         std::thread::sleep(POLL_INTERVAL);
     };
@@ -573,7 +614,7 @@ fn run_variant(
     RunOutcome::Done(parse_transcribe_output(&stdout), wall)
 }
 
-fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
@@ -581,6 +622,52 @@ fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinH
         }
         String::from_utf8_lossy(&buf).into_owned()
     })
+}
+
+/// Like [`spawn_reader`], and records when the "Model loaded in" line arrives
+/// so the run can be timed from that point.
+fn spawn_stdout_reader<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    loaded: Arc<OnceLock<Instant>>,
+) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let Some(pipe) = pipe else {
+            return text;
+        };
+        let mut reader = BufReader::new(pipe);
+        let mut line = Vec::new();
+        while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0) {
+            let chunk = String::from_utf8_lossy(&line);
+            if chunk.contains(MODEL_LOADED) {
+                let _ = loaded.set(Instant::now());
+            }
+            text.push_str(&chunk);
+            line.clear();
+        }
+        text
+    })
+}
+
+/// Kill a run together with anything it started. It was spawned as the leader
+/// of its own process group, so the group id is its pid.
+fn kill_run(child: &mut Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: killpg only sends a signal, to the run's own process group.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Builds whose first run can include one-time GPU shader or kernel compilation.
+fn compiles_on_first_run(variant: Variant) -> bool {
+    matches!(
+        variant.acceleration(),
+        Acceleration::Vulkan | Acceleration::Cuda | Acceleration::Migraphx
+    )
 }
 
 /// Parse `voxtype transcribe` stdout: timing comes from the "Model loaded in"
@@ -599,10 +686,10 @@ pub fn parse_transcribe_output(stdout: &str) -> TranscribeOutput {
 
     let lines: Vec<String> = stdout.lines().map(super::accel::strip_ansi).collect();
     for line in &lines {
-        if let Some(s) = secs_after(line, "Model loaded in ") {
+        if let Some(s) = secs_after(line, MODEL_LOADED) {
             out.model_load_secs = Some(s);
         }
-        if let Some(s) = secs_after(line, "Transcription completed in ") {
+        if let Some(s) = secs_after(line, TRANSCRIBED) {
             out.transcribe_secs = Some(s);
         }
     }
@@ -648,13 +735,18 @@ pub fn check_recording(samples: &[f32]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn wait_for_enter() -> std::io::Result<()> {
-    use tokio::io::AsyncBufReadExt;
-    let mut line = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut line)
-        .await
-        .map(|_| ())
+/// Wait for a line or end of file on stdin. The read runs on a plain thread
+/// rather than tokio's stdin: tokio parks that read on a blocking-pool task the
+/// runtime waits for at shutdown, so a read abandoned by the recording time cap
+/// would keep the process from ever exiting.
+async fn wait_for_enter() {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
 }
 
 fn say(json: bool, line: &str) {
@@ -762,22 +854,31 @@ fn acceptable(results: &[VariantResult]) -> Vec<&VariantResult> {
         .collect()
 }
 
-/// When to stop a run of `variant`: the fastest wall time of any *other*
-/// acceptable variant, plus slack, with the variant that set it. `None` until
+/// How far a run may fall behind before it is stopped, and which variant set
+/// that pace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    pub variant: Variant,
+    /// Transcription seconds allowed once the run's model has loaded.
+    pub transcribe_secs: f64,
+    /// Wall seconds allowed while the run has not reported its model loaded.
+    pub wall_secs: f64,
+}
+
+/// The pace for a run of `variant`: the typical (median) timings of the other
+/// acceptable variant that transcribes fastest, plus slack. `None` until
 /// another variant has finished accurately.
-pub fn stop_budget(results: &[VariantResult], variant: Variant) -> Option<(Variant, f64)> {
+pub fn pace_for(results: &[VariantResult], variant: Variant) -> Option<Pace> {
     acceptable(results)
         .into_iter()
         .filter(|r| r.variant != variant)
-        .filter_map(|r| {
-            r.wall_secs
-                .iter()
-                .copied()
-                .min_by(|a, b| a.total_cmp(b))
-                .map(|wall| (r.variant, wall))
-        })
+        .filter_map(|r| Some((r.variant, median(&r.observed_secs)?, median(&r.wall_secs)?)))
         .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(v, wall)| (v, wall * STOP_RATIO + STOP_SLACK_SECS))
+        .map(|(v, transcribe, wall)| Pace {
+            variant: v,
+            transcribe_secs: transcribe * STOP_RATIO + STOP_SLACK_SECS,
+            wall_secs: wall * LOAD_RATIO + LOAD_SLACK_SECS,
+        })
 }
 
 /// The fastest variant whose word error rate is within `WER_TOLERANCE` of the
@@ -983,6 +1084,7 @@ This is a longer test of voice activity detection with multiple words and phrase
         VariantResult {
             runs_secs: vec![median],
             median_secs: Some(median),
+            observed_secs: vec![median],
             wall_secs: vec![median + 0.5],
             word_error_rate: wer,
             transcript: Some("text".to_string()),
@@ -1035,27 +1137,47 @@ This is a longer test of voice activity detection with multiple words and phrase
     }
 
     #[test]
-    fn stop_budget_follows_the_fastest_other_accurate_variant() {
+    fn pace_follows_the_fastest_other_accurate_transcription() {
         let results = vec![
             result(Variant::WhisperVulkan, 0.6, Some(0.0)),
             // Faster, but wrong: must not set the pace.
             result(Variant::WhisperAvx2, 0.1, Some(0.9)),
             result(Variant::WhisperNative, 5.0, Some(0.0)),
         ];
-        let (pace, secs) = stop_budget(&results, Variant::WhisperNative).unwrap();
-        assert_eq!(pace, Variant::WhisperVulkan);
-        assert!((secs - (1.1 * STOP_RATIO + STOP_SLACK_SECS)).abs() < 1e-9);
+        let pace = pace_for(&results, Variant::WhisperNative).unwrap();
+        assert_eq!(pace.variant, Variant::WhisperVulkan);
+        assert!((pace.transcribe_secs - (0.6 * STOP_RATIO + STOP_SLACK_SECS)).abs() < 1e-9);
+        assert!((pace.wall_secs - (1.1 * LOAD_RATIO + LOAD_SLACK_SECS)).abs() < 1e-9);
 
         // A variant never races against itself.
-        let (pace, _) = stop_budget(&results, Variant::WhisperVulkan).unwrap();
-        assert_eq!(pace, Variant::WhisperNative);
+        let pace = pace_for(&results, Variant::WhisperVulkan).unwrap();
+        assert_eq!(pace.variant, Variant::WhisperNative);
         assert_eq!(
-            stop_budget(
+            pace_for(
                 &[result(Variant::WhisperVulkan, 0.6, Some(0.0))],
                 Variant::WhisperVulkan
             ),
             None
         );
+    }
+
+    /// One lucky run must not tighten the pace for every other variant.
+    #[test]
+    fn pace_uses_the_typical_run() {
+        let mut vulkan = result(Variant::WhisperVulkan, 0.6, Some(0.0));
+        vulkan.observed_secs = vec![0.2, 0.6, 0.7];
+        let pace = pace_for(&[vulkan], Variant::WhisperNative).unwrap();
+        assert!((pace.transcribe_secs - (0.6 * STOP_RATIO + STOP_SLACK_SECS)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_gpu_builds_are_spared_during_warm_up() {
+        assert!(compiles_on_first_run(Variant::WhisperVulkan));
+        assert!(compiles_on_first_run(Variant::OnnxCuda12));
+        assert!(compiles_on_first_run(Variant::OnnxMigraphx));
+        assert!(!compiles_on_first_run(Variant::WhisperNative));
+        assert!(!compiles_on_first_run(Variant::WhisperAvx512));
+        assert!(!compiles_on_first_run(Variant::OnnxAvx2));
     }
 
     #[test]
@@ -1225,5 +1347,80 @@ This is a longer test of voice activity detection with multiple words and phrase
         let result = run_benchmark(&input, &mut |_| {}, &AtomicBool::new(true));
         assert!(result.is_err());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_timed_runs_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(dir.path(), Variant::WhisperNative, "exit 0");
+        let mut input = fake_input(dir.path(), vec![Variant::WhisperNative]);
+        input.runs = 0;
+        assert!(run_benchmark(&input, &mut |_| {}, &AtomicBool::new(false)).is_err());
+    }
+
+    /// A fake `transcribe` that loads for `load` seconds, then transcribes for
+    /// `transcribe` seconds, and prints the passage with those timings.
+    #[cfg(unix)]
+    fn timed_script(load: f64, transcribe: f64) -> String {
+        format!(
+            "sleep {load}\nprintf 'INFO Model loaded in {load}s\\n'\nsleep {transcribe}\nprintf 'INFO Transcription completed in {transcribe}s: ok\\n\\n%s\\n' \"{PASSAGE}\""
+        )
+    }
+
+    /// Wall time is not the metric: a build that loads slowly but transcribes
+    /// faster must finish and win, while a build that only loads faster is
+    /// stopped once its transcription falls behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_loading_faster_transcriber_is_not_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(dir.path(), Variant::WhisperNative, &timed_script(0.05, 0.6));
+        fake_variant(dir.path(), Variant::WhisperAvx2, &timed_script(1.5, 0.1));
+        let input = fake_input(
+            dir.path(),
+            vec![Variant::WhisperNative, Variant::WhisperAvx2],
+        );
+        let report = run_benchmark(&input, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+
+        let slow_loader = report.result(Variant::WhisperAvx2).unwrap();
+        assert!(slow_loader.stopped.is_none(), "{:?}", slow_loader.stopped);
+        assert_eq!(report.recommended, Some(Variant::WhisperAvx2));
+        assert!(
+            report
+                .result(Variant::WhisperNative)
+                .unwrap()
+                .stopped
+                .is_some(),
+            "the slower transcriber is stopped during its transcription"
+        );
+    }
+
+    /// A GPU build's first run can include shader or kernel compilation, so it
+    /// is not stopped during warm-up even when that run is slow.
+    #[cfg(unix)]
+    #[test]
+    fn a_gpu_build_is_not_stopped_during_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(dir.path(), Variant::WhisperNative, &timed_script(0.05, 0.3));
+        let marker = dir.path().join("compiled");
+        fake_variant(
+            dir.path(),
+            Variant::WhisperVulkan,
+            &format!(
+                "if [ ! -e '{m}' ]; then touch '{m}'; sleep 5; fi\n{t}",
+                m = marker.display(),
+                t = timed_script(0.05, 0.1)
+            ),
+        );
+        let input = fake_input(
+            dir.path(),
+            vec![Variant::WhisperNative, Variant::WhisperVulkan],
+        );
+        let report = run_benchmark(&input, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+
+        let vulkan = report.result(Variant::WhisperVulkan).unwrap();
+        assert!(vulkan.stopped.is_none(), "{:?}", vulkan.stopped);
+        assert_eq!(vulkan.runs_secs, vec![0.1]);
     }
 }

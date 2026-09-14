@@ -763,10 +763,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             start_or_restart_daemon(app);
             Action::None
         }
-        KeyCode::Char('b') => {
-            app.open_benchmark();
-            Action::None
-        }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_cursor(-1, 0);
             Action::None
