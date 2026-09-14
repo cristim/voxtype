@@ -10,7 +10,7 @@
 //! time. They are reported as `InstallKind::Source` and switching is not
 //! applicable.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -299,7 +299,7 @@ pub enum Acceleration {
 }
 
 /// Every binary name voxtype recognizes in `/usr/lib/voxtype/`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Variant {
     WhisperAvx2,

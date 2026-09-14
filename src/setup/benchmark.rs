@@ -1,20 +1,25 @@
 //! `voxtype setup benchmark`: time the installed binary variants on this
 //! machine and recommend one from the measurements.
 //!
-//! Each variant runs as its own process through `voxtype transcribe`, because
-//! the packaged binaries in `/usr/lib/voxtype/` can be older than the binary
-//! running the benchmark, and that command's output is the interface they all
-//! share. The recording is of a known passage, so a variant that finishes
-//! quickly with the wrong words (a GPU build silently failing, say) is not the
-//! one recommended.
+//! The library half ([`run_benchmark`], [`record_until_enter`], the saved
+//! [`Report`]) is shared by the `setup benchmark` command and the benchmark
+//! screen in `voxtype configure`. Each variant runs as its own process through
+//! `voxtype transcribe`, because the packaged binaries in `/usr/lib/voxtype/`
+//! can be older than the binary running the benchmark, and that command's
+//! output is the interface they all share. The recording is of a known
+//! passage, so a variant that finishes quickly with the wrong words (a GPU
+//! build silently failing, say) is not the one recommended, and a variant that
+//! is already slower than an accurate one is stopped rather than waited for.
 
 use super::binary::{self, Variant, LIB_DIR};
-use crate::config::Config;
+use crate::config::{AudioConfig, Config};
 use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Text the user reads aloud. Plain words with no names or numbers, so the
 /// word error rate measures the variant rather than the model's spelling.
@@ -27,12 +32,20 @@ recommended.";
 /// be recommended for being faster.
 const WER_TOLERANCE: f64 = 0.05;
 
-/// Below this RMS the recording is treated as silence (roughly -46 dBFS).
-const MIN_RMS: f32 = 0.005;
+/// A run is stopped once it is this much slower than the fastest accurate run
+/// of another variant. The slack keeps near-ties from being cut off by noise.
+const STOP_RATIO: f64 = 1.10;
+const STOP_SLACK_SECS: f64 = 0.25;
 
-const MIN_RECORDING_SECS: f32 = 3.0;
-const MAX_RECORDING_SECS: u64 = 60;
+/// Below this RMS the recording is treated as silence (roughly -46 dBFS).
+pub const MIN_RMS: f32 = 0.005;
+pub const MIN_RECORDING_SECS: f32 = 3.0;
+pub const MAX_RECORDING_SECS: u64 = 60;
+pub const DEFAULT_RUNS: usize = 3;
+
 const SAMPLE_RATE: u32 = 16_000;
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+const REPORT_FILE: &str = "benchmark.json";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TranscribeOutput {
@@ -41,29 +54,145 @@ pub struct TranscribeOutput {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VariantResult {
     pub variant: Variant,
-    pub binary_name: &'static str,
+    pub binary_name: String,
     /// Transcription time of each timed run, in seconds.
     pub runs_secs: Vec<f64>,
     pub median_secs: Option<f64>,
     pub model_load_secs: Option<f64>,
+    /// Process wall time of every completed run, warm-up included. Sets the
+    /// pace other variants are stopped against.
+    #[serde(default)]
+    pub wall_secs: Vec<f64>,
     /// `None` when no reference text was available to score against.
     pub word_error_rate: Option<f64>,
     pub transcript: Option<String>,
     pub error: Option<String>,
+    /// Why the variant was stopped early, when it was.
+    #[serde(default)]
+    pub stopped: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct Report {
-    engine: &'static str,
-    audio_secs: f32,
-    results: Vec<VariantResult>,
-    recommended: Option<Variant>,
-    warnings: Vec<String>,
+impl VariantResult {
+    fn new(variant: Variant) -> Self {
+        Self {
+            variant,
+            binary_name: variant.binary_name().to_string(),
+            runs_secs: Vec::new(),
+            median_secs: None,
+            model_load_secs: None,
+            wall_secs: Vec::new(),
+            word_error_rate: None,
+            transcript: None,
+            error: None,
+            stopped: None,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.error.is_none() && self.stopped.is_none()
+    }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Report {
+    /// Unix time of the measurement, in seconds.
+    pub measured_at: u64,
+    pub engine: String,
+    pub audio_secs: f32,
+    /// Whether word error rates were scored against the passage.
+    pub scored: bool,
+    pub results: Vec<VariantResult>,
+    pub recommended: Option<Variant>,
+    pub warnings: Vec<String>,
+}
+
+impl Report {
+    pub fn result(&self, variant: Variant) -> Option<&VariantResult> {
+        self.results.iter().find(|r| r.variant == variant)
+    }
+
+    /// True when the variants that can run the engine here are no longer the
+    /// ones that were measured, e.g. a build was installed or removed since.
+    pub fn is_stale(&self, eligible_now: &[Variant]) -> bool {
+        self.results.len() != eligible_now.len()
+            || !self
+                .results
+                .iter()
+                .all(|r| eligible_now.contains(&r.variant))
+    }
+}
+
+/// Progress of [`run_benchmark`], reported as it happens.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BenchEvent {
+    WarmUp(Variant),
+    Run {
+        round: usize,
+        runs: usize,
+        variant: Variant,
+    },
+    Finished {
+        variant: Variant,
+        secs: f64,
+    },
+    Stopped {
+        variant: Variant,
+        after_secs: f64,
+        faster: Variant,
+    },
+    Failed {
+        variant: Variant,
+        error: String,
+    },
+}
+
+impl BenchEvent {
+    pub fn describe(&self) -> String {
+        match self {
+            BenchEvent::WarmUp(v) => format!("warm-up    {}", v.display()),
+            BenchEvent::Run {
+                round,
+                runs,
+                variant,
+            } => format!("run {}/{}    {}", round, runs, variant.display()),
+            BenchEvent::Finished { variant, secs } => {
+                format!("           {} finished in {:.2}s", variant.display(), secs)
+            }
+            BenchEvent::Stopped {
+                variant,
+                after_secs,
+                faster,
+            } => format!(
+                "           {} stopped after {:.1}s: already slower than {}",
+                variant.display(),
+                after_secs,
+                faster.display()
+            ),
+            BenchEvent::Failed { variant, error } => {
+                format!("           {} failed: {}", variant.display(), error)
+            }
+        }
+    }
+}
+
+pub struct BenchmarkInput {
+    pub engine: String,
+    /// Variants in the order to run them. The likeliest fastest goes first so
+    /// it sets the pace and slower variants can be stopped early.
+    pub candidates: Vec<Variant>,
+    pub wav: PathBuf,
+    /// Text the recording should contain; `None` skips accuracy scoring.
+    pub reference: Option<String>,
+    pub runs: usize,
+    pub config_path: Option<PathBuf>,
+    /// Directory holding the variant binaries, normally [`LIB_DIR`].
+    pub lib_dir: PathBuf,
+}
+
+/// The `voxtype setup benchmark` command.
 pub async fn run(
     config: &Config,
     config_path: Option<&Path>,
@@ -71,7 +200,23 @@ pub async fn run(
     runs: usize,
     save_audio: Option<PathBuf>,
     json: bool,
+    record_to: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    if let Some(dest) = record_to {
+        // Child mode for `voxtype configure`: record until the parent writes a
+        // newline, save, report, exit.
+        let samples = record_until_enter(&config.audio).await?;
+        write_wav(&dest, &samples)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "secs": samples.len() as f32 / SAMPLE_RATE as f32,
+                "rms": rms(&samples),
+            })
+        );
+        return Ok(());
+    }
+
     let engine = config.engine.name();
     let candidates = candidates(engine);
     if candidates.is_empty() {
@@ -82,28 +227,25 @@ pub async fn run(
             engine
         );
     }
-
-    let mut warnings = Vec::new();
-    if let Some(w) = load_warning() {
-        warnings.push(w);
-    }
-    if crate::daemon_status::read_pid_if_alive().is_some() {
-        warnings.push(
-            "The voxtype daemon is running. It keeps a model loaded and competes for the \
-             same CPU and GPU, which can slow every variant down."
-                .to_string(),
-        );
-    }
-    for w in &warnings {
+    for w in warnings() {
         say(json, &format!("Note: {}", w));
     }
 
     // Holds the temporary recording until the benchmark finishes.
     let mut _recording: Option<tempfile::NamedTempFile> = None;
-    let (wav_path, reference): (PathBuf, Option<&str>) = match audio {
+    let (wav, reference) = match audio {
         Some(path) => (path, None),
         None => {
-            let samples = record_passage(config, json).await?;
+            say(json, "Read this passage aloud:\n");
+            say(json, &format!("  {}\n", PASSAGE));
+            say(json, "Press Enter to start recording.");
+            wait_for_enter().await?;
+            say(
+                json,
+                "Recording. Press Enter when you have finished reading.",
+            );
+            let samples = record_until_enter(&config.audio).await?;
+
             let file = tempfile::Builder::new()
                 .prefix("voxtype-benchmark-")
                 .suffix(".wav")
@@ -116,221 +258,329 @@ pub async fn run(
             }
             let path = file.path().to_path_buf();
             _recording = Some(file);
-            (path, Some(PASSAGE))
+            (path, Some(PASSAGE.to_string()))
         }
     };
-    let audio_secs = wav_duration_secs(&wav_path)?;
 
     say(
         json,
         &format!(
-            "\nBenchmarking {} variant(s) on {:.1}s of audio: one warm-up run each, then {} timed run(s).",
+            "\nBenchmarking {} variant(s): one warm-up run each, then {} timed run(s). \
+             A variant already slower than an accurate one is stopped.",
             candidates.len(),
-            audio_secs,
             runs
         ),
     );
+    let input = BenchmarkInput {
+        engine: engine.to_string(),
+        candidates,
+        wav,
+        reference,
+        runs,
+        config_path: config_path.map(Path::to_path_buf),
+        lib_dir: PathBuf::from(LIB_DIR),
+    };
+    let cancel = AtomicBool::new(false);
+    let report = run_benchmark(
+        &input,
+        &mut |event| say(json, &format!("  {}", event.describe())),
+        &cancel,
+    )?;
+    let saved = save_report(&report);
 
-    let mut results: Vec<VariantResult> = candidates
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!();
+        for line in report_lines(&report) {
+            println!("{}", line);
+        }
+        if let Some(best) = report.recommended {
+            if binary::active_variant() == Some(best) {
+                println!("It is already the active variant.");
+            } else {
+                println!(
+                    "Switch with: sudo voxtype setup variant --to {}",
+                    best.binary_name()
+                );
+            }
+        }
+    }
+    match saved {
+        Ok(path) => say(
+            json,
+            &format!(
+                "\nSaved to {}. `voxtype configure` and `voxtype info variants` show these results.",
+                path.display()
+            ),
+        ),
+        Err(e) => say(json, &format!("\nCould not save the results: {}", e)),
+    }
+    Ok(())
+}
+
+/// Installed variants in `installed` that can run `engine` on this CPU and GPU.
+pub fn eligible(
+    installed: &[Variant],
+    cpu: &binary::Cpu,
+    gpus: &binary::Gpus,
+    engine: &str,
+) -> Vec<Variant> {
+    installed
         .iter()
-        .map(|&v| VariantResult {
-            variant: v,
-            binary_name: v.binary_name(),
-            runs_secs: Vec::new(),
-            median_secs: None,
-            model_load_secs: None,
-            word_error_rate: None,
-            transcript: None,
-            error: None,
+        .copied()
+        .filter(|&v| {
+            v.supports_engine(engine)
+                && binary::variant_runs_on_cpu(v, cpu)
+                && binary::variant_gpu_available(v, gpus)
         })
+        .collect()
+}
+
+/// Variants to benchmark for `engine`, with the hardware recommendation first
+/// so it sets the pace for the others. Reads the lib dir directly so a source
+/// build can still benchmark the packaged binaries.
+pub fn candidates(engine: &str) -> Vec<Variant> {
+    let inv = binary::inventory();
+    let mut found = eligible(&binary::enumerate_installed(), &inv.cpu, &inv.gpus, engine);
+    let rec = inv.recommendation;
+    found.sort_by_key(|&v| !(v == rec.whisper || v == rec.onnx));
+    found
+}
+
+/// Conditions that make timings unreliable.
+pub fn warnings() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(w) = load_warning() {
+        out.push(w);
+    }
+    if crate::daemon_status::read_pid_if_alive().is_some() {
+        out.push(
+            "The voxtype daemon is running. It keeps a model loaded and competes for the \
+             same CPU and GPU, which can slow every variant down."
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// Warm up and time every candidate, stopping any run that falls behind an
+/// accurate variant, and recommend one. Blocking.
+pub fn run_benchmark(
+    input: &BenchmarkInput,
+    on_event: &mut dyn FnMut(BenchEvent),
+    cancel: &AtomicBool,
+) -> anyhow::Result<Report> {
+    let audio_secs = wav_duration_secs(&input.wav)?;
+    let warnings = warnings();
+    let mut results: Vec<VariantResult> = input
+        .candidates
+        .iter()
+        .map(|&v| VariantResult::new(v))
         .collect();
 
     // Warm-up: fills the page cache with the model and builds any GPU shader
     // cache, which would otherwise be charged to whichever variant runs first.
-    for result in &mut results {
-        say(json, &format!("  warm-up  {}", result.variant.display()));
-        if let Err(e) = run_variant(result.variant, &wav_path, config_path) {
-            result.error = Some(e.to_string());
-        }
+    for i in 0..results.len() {
+        check_cancelled(cancel)?;
+        on_event(BenchEvent::WarmUp(results[i].variant));
+        run_once(input, &mut results, i, false, on_event, cancel)?;
     }
 
     // Alternate the order each round so thermal throttling and background
     // load do not consistently favour the same variant.
-    for round in 0..runs {
+    for round in 0..input.runs {
         let mut order: Vec<usize> = (0..results.len()).collect();
         if round % 2 == 1 {
             order.reverse();
         }
         for i in order {
-            let result = &mut results[i];
-            if result.error.is_some() {
+            if !results[i].finished() {
                 continue;
             }
-            say(
-                json,
-                &format!("  run {}/{}  {}", round + 1, runs, result.variant.display()),
-            );
-            match run_variant(result.variant, &wav_path, config_path) {
-                Ok((output, wall_secs)) => {
-                    result
-                        .runs_secs
-                        .push(output.transcribe_secs.unwrap_or(wall_secs));
-                    if result.model_load_secs.is_none() {
-                        result.model_load_secs = output.model_load_secs;
-                    }
-                    result.word_error_rate = reference.map(|r| word_error_rate(r, &output.text));
-                    result.transcript = Some(output.text);
-                }
-                Err(e) => result.error = Some(e.to_string()),
-            }
+            check_cancelled(cancel)?;
+            on_event(BenchEvent::Run {
+                round: round + 1,
+                runs: input.runs,
+                variant: results[i].variant,
+            });
+            run_once(input, &mut results, i, true, on_event, cancel)?;
         }
     }
+
     for result in &mut results {
         result.median_secs = median(&result.runs_secs);
     }
-
     let recommended = pick_recommendation(&results);
+    Ok(Report {
+        measured_at: now_secs(),
+        engine: input.engine.clone(),
+        audio_secs,
+        scored: input.reference.is_some(),
+        results,
+        recommended,
+        warnings,
+    })
+}
 
-    if json {
-        let report = Report {
-            engine,
-            audio_secs,
-            results,
-            recommended,
-            warnings,
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print_report(&results, audio_secs, recommended);
+fn check_cancelled(cancel: &AtomicBool) -> anyhow::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        anyhow::bail!("Benchmark cancelled");
     }
     Ok(())
 }
 
-/// Installed variants that can run `engine` on this CPU and GPU. Reads the lib
-/// dir directly so a source build can still benchmark the packaged binaries.
-fn candidates(engine: &str) -> Vec<Variant> {
-    let cpu = binary::detect_cpu();
-    let gpus = binary::detect_gpus();
-    binary::enumerate_installed()
-        .into_iter()
-        .filter(|&v| {
-            v.supports_engine(engine)
-                && binary::variant_runs_on_cpu(v, &cpu)
-                && binary::variant_gpu_available(v, &gpus)
-        })
-        .collect()
-}
-
-fn say(json: bool, line: &str) {
-    // Keep stdout clean for the JSON report.
-    if json {
-        eprintln!("{}", line);
-    } else {
-        println!("{}", line);
-    }
-}
-
-async fn record_passage(config: &Config, json: bool) -> anyhow::Result<Vec<f32>> {
-    say(json, "Read this passage aloud:\n");
-    say(json, &format!("  {}\n", PASSAGE));
-    say(json, "Press Enter to start recording.");
-    wait_for_enter().await?;
-
-    let mut capture = crate::audio::create_capture(&config.audio)?;
-    let mut chunks = capture.start().await?;
-    // Drain the live chunk channel so it can never fill up; the full recording
-    // comes back from stop().
-    let drain = tokio::spawn(async move { while chunks.recv().await.is_some() {} });
-
-    say(
-        json,
-        "Recording. Press Enter when you have finished reading.",
+/// Run variant `i` once and fold the outcome into its result.
+fn run_once(
+    input: &BenchmarkInput,
+    results: &mut [VariantResult],
+    i: usize,
+    timed: bool,
+    on_event: &mut dyn FnMut(BenchEvent),
+    cancel: &AtomicBool,
+) -> anyhow::Result<()> {
+    let variant = results[i].variant;
+    let budget = stop_budget(results, variant);
+    let outcome = run_variant(
+        &input.lib_dir,
+        variant,
+        &input.wav,
+        input.config_path.as_deref(),
+        budget.map(|(_, secs)| secs),
+        cancel,
     );
-    let _ = tokio::time::timeout(Duration::from_secs(MAX_RECORDING_SECS), wait_for_enter()).await;
-    let samples = capture.stop().await?;
-    drain.abort();
 
-    let secs = samples.len() as f32 / SAMPLE_RATE as f32;
-    if secs < MIN_RECORDING_SECS {
-        anyhow::bail!(
-            "The recording is only {:.1}s long. Read the whole passage before pressing Enter.",
-            secs
-        );
+    match outcome {
+        RunOutcome::Done(output, wall) => {
+            let result = &mut results[i];
+            let secs = output.transcribe_secs.unwrap_or(wall);
+            result.wall_secs.push(wall);
+            if timed {
+                result.runs_secs.push(secs);
+            }
+            if result.model_load_secs.is_none() {
+                result.model_load_secs = output.model_load_secs;
+            }
+            result.word_error_rate = input
+                .reference
+                .as_deref()
+                .map(|reference| word_error_rate(reference, &output.text));
+            result.transcript = Some(output.text);
+            on_event(BenchEvent::Finished { variant, secs });
+        }
+        RunOutcome::Stopped(after_secs) => {
+            // Only reachable with a budget, which names the faster variant.
+            let faster = budget.map_or(variant, |(v, _)| v);
+            results[i].stopped = Some(format!(
+                "stopped after {:.1}s, slower than {}",
+                after_secs,
+                faster.display()
+            ));
+            on_event(BenchEvent::Stopped {
+                variant,
+                after_secs,
+                faster,
+            });
+        }
+        RunOutcome::Failed(error) => {
+            results[i].error = Some(error.clone());
+            on_event(BenchEvent::Failed { variant, error });
+        }
+        RunOutcome::Cancelled => anyhow::bail!("Benchmark cancelled"),
     }
-    if rms(&samples) < MIN_RMS {
-        anyhow::bail!(
-            "The recording is silent, so the microphone is not delivering audio.\n\
-             Check the input device with: voxtype info devices"
-        );
-    }
-    Ok(samples)
-}
-
-async fn wait_for_enter() -> std::io::Result<()> {
-    use tokio::io::AsyncBufReadExt;
-    let mut line = String::new();
-    tokio::io::BufReader::new(tokio::io::stdin())
-        .read_line(&mut line)
-        .await
-        .map(|_| ())
-}
-
-fn write_wav(path: &Path, samples: &[f32]) -> anyhow::Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(path, spec)?;
-    for &s in samples {
-        writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
-    }
-    writer.finalize()?;
     Ok(())
 }
 
-fn wav_duration_secs(path: &Path) -> anyhow::Result<f32> {
-    let reader = hound::WavReader::open(path)
-        .with_context(|| format!("Cannot read {} as a WAV file", path.display()))?;
-    let spec = reader.spec();
-    Ok(reader.duration() as f32 / spec.sample_rate as f32)
+enum RunOutcome {
+    Done(TranscribeOutput, f64),
+    Stopped(f64),
+    Failed(String),
+    Cancelled,
 }
 
-/// Run one variant's `transcribe` on `wav`, returning its parsed output and the
-/// process wall time.
+/// Run one variant's `transcribe` on `wav`. The process is killed once it runs
+/// past `stop_after` seconds, or when `cancel` is set.
 fn run_variant(
+    lib_dir: &Path,
     variant: Variant,
     wav: &Path,
     config_path: Option<&Path>,
-) -> anyhow::Result<(TranscribeOutput, f64)> {
-    let binary = Path::new(LIB_DIR).join(variant.binary_name());
+    stop_after: Option<f64>,
+    cancel: &AtomicBool,
+) -> RunOutcome {
+    let binary = lib_dir.join(variant.binary_name());
     let mut cmd = Command::new(&binary);
     if let Some(path) = config_path {
         cmd.arg("--config").arg(path);
     }
-    cmd.arg("transcribe").arg(wav);
+    cmd.arg("transcribe")
+        .arg(wav)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let start = Instant::now();
-    let output = cmd
-        .output()
-        .with_context(|| format!("Cannot run {}", binary.display()))?;
-    let wall_secs = start.elapsed().as_secs_f64();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return RunOutcome::Failed(format!("cannot run {}: {}", binary.display(), e)),
+    };
+    // Drain both pipes on their own threads so a chatty child cannot block on
+    // a full pipe while it is being waited for.
+    let stdout = spawn_reader(child.stdout.take());
+    let stderr = spawn_reader(child.stderr.take());
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-        anyhow::bail!(
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return RunOutcome::Failed(format!("waiting for {}: {}", binary.display(), e));
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return RunOutcome::Cancelled;
+        }
+        if stop_after.is_some_and(|limit| elapsed > limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return RunOutcome::Stopped(elapsed);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    let wall = start.elapsed().as_secs_f64();
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+
+    if !status.success() {
+        let last = stderr
+            .lines()
+            .rev()
+            .map(super::accel::strip_ansi)
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_else(|| "no error output".to_string());
+        return RunOutcome::Failed(format!(
             "{} exited with {}: {}",
             variant.binary_name(),
-            output.status,
-            last.unwrap_or("no error output")
-        );
+            status,
+            last
+        ));
     }
-    Ok((
-        parse_transcribe_output(&String::from_utf8_lossy(&output.stdout)),
-        wall_secs,
-    ))
+    RunOutcome::Done(parse_transcribe_output(&stdout), wall)
+}
+
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
 }
 
 /// Parse `voxtype transcribe` stdout: timing comes from the "Model loaded in"
@@ -360,6 +610,82 @@ pub fn parse_transcribe_output(stdout: &str) -> TranscribeOutput {
         out.text = lines[blank + 1..].join(" ").trim().to_string();
     }
     out
+}
+
+/// Record from the configured input until a line or end of file arrives on
+/// stdin, or [`MAX_RECORDING_SECS`] pass. Used by the interactive command and
+/// by the `--record-to` child that `voxtype configure` drives, which keeps
+/// audio device access out of the TUI process (see #541).
+pub async fn record_until_enter(audio: &AudioConfig) -> anyhow::Result<Vec<f32>> {
+    let mut capture = crate::audio::create_capture(audio)?;
+    let mut chunks = capture.start().await?;
+    // Drain the live chunk channel; the full recording comes back from stop().
+    let drain = tokio::spawn(async move { while chunks.recv().await.is_some() {} });
+
+    let _ = tokio::time::timeout(Duration::from_secs(MAX_RECORDING_SECS), wait_for_enter()).await;
+    let samples = capture.stop().await?;
+    drain.abort();
+
+    check_recording(&samples)?;
+    Ok(samples)
+}
+
+/// Reject a recording too short or too quiet to benchmark with.
+pub fn check_recording(samples: &[f32]) -> anyhow::Result<()> {
+    let secs = samples.len() as f32 / SAMPLE_RATE as f32;
+    if secs < MIN_RECORDING_SECS {
+        anyhow::bail!(
+            "The recording is only {:.1}s long. Read the whole passage before stopping.",
+            secs
+        );
+    }
+    if rms(samples) < MIN_RMS {
+        anyhow::bail!(
+            "The recording is silent, so the microphone is not delivering audio. \
+             Check the input device with: voxtype info devices"
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_enter() -> std::io::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    tokio::io::BufReader::new(tokio::io::stdin())
+        .read_line(&mut line)
+        .await
+        .map(|_| ())
+}
+
+fn say(json: bool, line: &str) {
+    // Keep stdout clean for the JSON report.
+    if json {
+        eprintln!("{}", line);
+    } else {
+        println!("{}", line);
+    }
+}
+
+fn write_wav(path: &Path, samples: &[f32]) -> anyhow::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    for &s in samples {
+        writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+fn wav_duration_secs(path: &Path) -> anyhow::Result<f32> {
+    let reader = hound::WavReader::open(path)
+        .with_context(|| format!("Cannot read {} as a WAV file", path.display()))?;
+    let spec = reader.spec();
+    Ok(reader.duration() as f32 / spec.sample_rate as f32)
 }
 
 fn normalize_words(text: &str) -> Vec<String> {
@@ -411,28 +737,57 @@ pub fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
-/// The fastest variant whose word error rate is within `WER_TOLERANCE` of the
-/// best. Without a reference text, the fastest variant that produced any text.
-pub fn pick_recommendation(results: &[VariantResult]) -> Option<Variant> {
-    let finished: Vec<&VariantResult> = results
+/// Results good enough to recommend or to set the pace: finished, produced
+/// text, and within `WER_TOLERANCE` of the most accurate when scored.
+fn acceptable(results: &[VariantResult]) -> Vec<&VariantResult> {
+    let usable: Vec<&VariantResult> = results
         .iter()
-        .filter(|r| r.error.is_none() && r.median_secs.is_some())
-        .filter(|r| r.transcript.as_deref().is_some_and(|t| !t.is_empty()))
+        .filter(|r| r.finished())
+        .filter(|r| {
+            r.transcript
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+        })
         .collect();
-
-    let best_wer = finished
+    let best_wer = usable
         .iter()
         .filter_map(|r| r.word_error_rate)
         .min_by(|a, b| a.total_cmp(b));
-
-    finished
+    usable
         .into_iter()
         .filter(|r| match (best_wer, r.word_error_rate) {
             (Some(best), Some(wer)) => wer <= best + WER_TOLERANCE,
             _ => true,
         })
-        .min_by(|a, b| a.median_secs.unwrap().total_cmp(&b.median_secs.unwrap()))
-        .map(|r| r.variant)
+        .collect()
+}
+
+/// When to stop a run of `variant`: the fastest wall time of any *other*
+/// acceptable variant, plus slack, with the variant that set it. `None` until
+/// another variant has finished accurately.
+pub fn stop_budget(results: &[VariantResult], variant: Variant) -> Option<(Variant, f64)> {
+    acceptable(results)
+        .into_iter()
+        .filter(|r| r.variant != variant)
+        .filter_map(|r| {
+            r.wall_secs
+                .iter()
+                .copied()
+                .min_by(|a, b| a.total_cmp(b))
+                .map(|wall| (r.variant, wall))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(v, wall)| (v, wall * STOP_RATIO + STOP_SLACK_SECS))
+}
+
+/// The fastest variant whose word error rate is within `WER_TOLERANCE` of the
+/// best. Without a reference text, the fastest variant that produced any text.
+pub fn pick_recommendation(results: &[VariantResult]) -> Option<Variant> {
+    acceptable(results)
+        .into_iter()
+        .filter_map(|r| r.median_secs.map(|m| (r.variant, m)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(v, _)| v)
 }
 
 fn load_warning() -> Option<String> {
@@ -448,56 +803,125 @@ fn load_warning() -> Option<String> {
     })
 }
 
-fn print_report(results: &[VariantResult], audio_secs: f32, recommended: Option<Variant>) {
-    println!();
-    println!(
-        "{:<22} {:>12} {:>11} {:>10} {:>11}",
+/// The results table and recommendation, shared by the command and the TUI.
+pub fn report_lines(report: &Report) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<22} {:>11} {:>11} {:>10} {:>11}",
         "Variant", "Transcribe", "Model load", "RT factor", "Word errors"
-    );
-    for r in results {
-        let mark = if Some(r.variant) == recommended {
+    )];
+    for r in &report.results {
+        let name = r.variant.display();
+        if let Some(err) = &r.error {
+            lines.push(format!("{:<22} failed: {}", name, err));
+            continue;
+        }
+        if let Some(why) = &r.stopped {
+            lines.push(format!("{:<22} {}", name, why));
+            continue;
+        }
+        let secs = |v: Option<f64>| v.map_or("n/a".to_string(), |s| format!("{:.2}s", s));
+        let rt = r.median_secs.map_or("n/a".to_string(), |s| {
+            format!("{:.2}x", s / f64::from(report.audio_secs))
+        });
+        let wer = r
+            .word_error_rate
+            .map_or("n/a".to_string(), |w| format!("{:.1}%", w * 100.0));
+        let mark = if Some(r.variant) == report.recommended {
             "  ★"
         } else {
             ""
         };
-        if let Some(err) = &r.error {
-            println!("{:<22} failed: {}", r.variant.display(), err);
-            continue;
-        }
-        let secs = |v: Option<f64>| v.map_or("n/a".to_string(), |s| format!("{:.2}s", s));
-        println!(
-            "{:<22} {:>12} {:>11} {:>10} {:>11}{}",
-            r.variant.display(),
+        lines.push(format!(
+            "{:<22} {:>11} {:>11} {:>10} {:>11}{}",
+            name,
             secs(r.median_secs),
             secs(r.model_load_secs),
-            r.median_secs.map_or("n/a".to_string(), |s| format!(
-                "{:.2}x",
-                s / audio_secs as f64
-            )),
-            r.word_error_rate
-                .map_or("n/a".to_string(), |w| format!("{:.1}%", w * 100.0)),
+            rt,
+            wer,
             mark
-        );
+        ));
     }
-    println!();
+    lines.push(String::new());
+    match report.recommended {
+        Some(best) => {
+            lines.push(format!(
+                "Recommended on this machine: {} ({})",
+                best.display(),
+                best.binary_name()
+            ));
+            if !report.scored {
+                lines.push(
+                    "Accuracy was not scored without the passage, so this is simply the fastest."
+                        .to_string(),
+                );
+            }
+        }
+        None => lines.push(
+            "No variant produced a usable transcription, so there is no recommendation."
+                .to_string(),
+        ),
+    }
+    lines
+}
 
-    let Some(best) = recommended else {
-        println!("No variant produced a usable transcription, so there is no recommendation.");
-        return;
-    };
-    println!(
-        "Recommended on this machine: {} ({})",
-        best.display(),
-        best.binary_name()
-    );
-    if binary::active_variant() == Some(best) {
-        println!("It is already the active variant.");
-    } else {
-        println!(
-            "Switch with: sudo voxtype setup variant --to {}",
-            best.binary_name()
-        );
+/// One line describing the measured pick, e.g.
+/// "Whisper (Vulkan) · 0.64s · 0% word errors · 2 h ago".
+pub fn summary(report: &Report, now: u64) -> Option<String> {
+    let best = report.result(report.recommended?)?;
+    let mut parts = vec![best.variant.display().to_string()];
+    if let Some(secs) = best.median_secs {
+        parts.push(format!("{:.2}s", secs));
     }
+    if let Some(wer) = best.word_error_rate {
+        parts.push(format!("{:.0}% word errors", wer * 100.0));
+    }
+    parts.push(age(report.measured_at, now));
+    Some(parts.join(" · "))
+}
+
+pub fn age(then: u64, now: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{} min ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Where the last benchmark is saved: `$XDG_STATE_HOME/voxtype/benchmark.json`.
+pub fn report_path() -> PathBuf {
+    Config::state_dir().join(REPORT_FILE)
+}
+
+pub fn save_report(report: &Report) -> anyhow::Result<PathBuf> {
+    let path = report_path();
+    save_report_to(report, &path)?;
+    Ok(path)
+}
+
+pub fn load_report() -> Option<Report> {
+    load_report_from(&report_path())
+}
+
+fn save_report_to(report: &Report, path: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(report)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn load_report_from(path: &Path) -> Option<Report> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 #[cfg(test)]
@@ -557,14 +981,12 @@ This is a longer test of voice activity detection with multiple words and phrase
 
     fn result(v: Variant, median: f64, wer: Option<f64>) -> VariantResult {
         VariantResult {
-            variant: v,
-            binary_name: v.binary_name(),
             runs_secs: vec![median],
             median_secs: Some(median),
-            model_load_secs: None,
+            wall_secs: vec![median + 0.5],
             word_error_rate: wer,
             transcript: Some("text".to_string()),
-            error: None,
+            ..VariantResult::new(v)
         }
     }
 
@@ -587,13 +1009,16 @@ This is a longer test of voice activity detection with multiple words and phrase
     }
 
     #[test]
-    fn failed_and_empty_variants_are_skipped() {
+    fn failed_stopped_and_empty_variants_are_skipped() {
         let mut failed = result(Variant::WhisperVulkan, 0.1, Some(0.0));
         failed.error = Some("exited with 1".to_string());
-        let mut empty = result(Variant::WhisperAvx2, 0.2, None);
+        let mut stopped = result(Variant::WhisperAvx512, 0.2, Some(0.0));
+        stopped.stopped = Some("stopped after 1.0s".to_string());
+        let mut empty = result(Variant::WhisperAvx2, 0.3, None);
         empty.transcript = Some(String::new());
         let results = vec![
             failed,
+            stopped,
             empty,
             result(Variant::WhisperNative, 1.3, Some(0.0)),
         ];
@@ -610,12 +1035,195 @@ This is a longer test of voice activity detection with multiple words and phrase
     }
 
     #[test]
+    fn stop_budget_follows_the_fastest_other_accurate_variant() {
+        let results = vec![
+            result(Variant::WhisperVulkan, 0.6, Some(0.0)),
+            // Faster, but wrong: must not set the pace.
+            result(Variant::WhisperAvx2, 0.1, Some(0.9)),
+            result(Variant::WhisperNative, 5.0, Some(0.0)),
+        ];
+        let (pace, secs) = stop_budget(&results, Variant::WhisperNative).unwrap();
+        assert_eq!(pace, Variant::WhisperVulkan);
+        assert!((secs - (1.1 * STOP_RATIO + STOP_SLACK_SECS)).abs() < 1e-9);
+
+        // A variant never races against itself.
+        let (pace, _) = stop_budget(&results, Variant::WhisperVulkan).unwrap();
+        assert_eq!(pace, Variant::WhisperNative);
+        assert_eq!(
+            stop_budget(
+                &[result(Variant::WhisperVulkan, 0.6, Some(0.0))],
+                Variant::WhisperVulkan
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn recordings_must_be_long_and_loud_enough() {
+        let second = SAMPLE_RATE as usize;
+        assert!(check_recording(&vec![0.1; second]).is_err());
+        assert!(check_recording(&vec![0.0; 5 * second]).is_err());
+        let voiced: Vec<f32> = (0..5 * second)
+            .map(|i| if i % 2 == 0 { 0.1 } else { -0.1 })
+            .collect();
+        assert!(check_recording(&voiced).is_ok());
+    }
+
+    #[test]
     fn median_and_rms() {
         assert_eq!(median(&[]), None);
         assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
         assert_eq!(median(&[4.0, 1.0, 2.0, 3.0]), Some(2.5));
         assert_eq!(rms(&[]), 0.0);
-        assert!(rms(&vec![0.0; 1000]) < MIN_RMS);
         assert!(rms(&[0.1, -0.1, 0.1, -0.1]) > MIN_RMS);
+    }
+
+    fn report(results: Vec<VariantResult>) -> Report {
+        let recommended = pick_recommendation(&results);
+        Report {
+            measured_at: 1_000,
+            engine: "whisper".to_string(),
+            audio_secs: 12.0,
+            scored: true,
+            results,
+            recommended,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn report_round_trips_and_notices_changed_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join(REPORT_FILE);
+        let saved = report(vec![
+            result(Variant::WhisperVulkan, 0.6, Some(0.0)),
+            result(Variant::WhisperNative, 1.3, Some(0.0)),
+        ]);
+        save_report_to(&saved, &path).unwrap();
+        let loaded = load_report_from(&path).unwrap();
+        assert_eq!(loaded.recommended, Some(Variant::WhisperVulkan));
+        assert_eq!(loaded.results, saved.results);
+
+        assert!(!loaded.is_stale(&[Variant::WhisperNative, Variant::WhisperVulkan]));
+        assert!(loaded.is_stale(&[Variant::WhisperVulkan]));
+        assert!(loaded.is_stale(&[
+            Variant::WhisperVulkan,
+            Variant::WhisperNative,
+            Variant::WhisperAvx2
+        ]));
+        assert!(load_report_from(&dir.path().join("missing.json")).is_none());
+    }
+
+    #[test]
+    fn summary_and_age_read_naturally() {
+        let r = report(vec![result(Variant::WhisperVulkan, 0.64, Some(0.0))]);
+        assert_eq!(
+            summary(&r, 1_000 + 7_200).as_deref(),
+            Some("Whisper (Vulkan) · 0.64s · 0% word errors · 2 h ago")
+        );
+        assert_eq!(age(100, 130), "just now");
+        assert_eq!(age(0, 600), "10 min ago");
+        assert_eq!(age(0, 3 * 86_400), "3 days ago");
+    }
+
+    #[cfg(unix)]
+    fn fake_variant(dir: &Path, variant: Variant, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(variant.binary_name());
+        std::fs::write(&path, format!("#!/bin/sh\n{}\n", script)).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_input(dir: &Path, candidates: Vec<Variant>) -> BenchmarkInput {
+        let wav = dir.join("clip.wav");
+        write_wav(&wav, &vec![0.0; SAMPLE_RATE as usize]).unwrap();
+        BenchmarkInput {
+            engine: "whisper".to_string(),
+            candidates,
+            wav,
+            reference: Some(PASSAGE.to_string()),
+            runs: 1,
+            config_path: None,
+            lib_dir: dir.to_path_buf(),
+        }
+    }
+
+    /// Runs real child processes: a quick accurate variant, and one that would
+    /// take 30 seconds. The slow one must be stopped instead of waited for.
+    #[cfg(unix)]
+    #[test]
+    fn a_variant_slower_than_an_accurate_one_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(
+            dir.path(),
+            Variant::WhisperVulkan,
+            &format!(
+                "sleep 0.2\nprintf 'INFO Model loaded in 0.05s\\nINFO Transcription completed in 0.10s: ok\\n\\n%s\\n' \"{}\"",
+                PASSAGE
+            ),
+        );
+        fake_variant(dir.path(), Variant::WhisperNative, "exec sleep 30");
+
+        let input = fake_input(
+            dir.path(),
+            vec![Variant::WhisperVulkan, Variant::WhisperNative],
+        );
+        let mut events = Vec::new();
+        let start = Instant::now();
+        let report =
+            run_benchmark(&input, &mut |e| events.push(e), &AtomicBool::new(false)).unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the slow variant was waited for"
+        );
+        assert_eq!(report.recommended, Some(Variant::WhisperVulkan));
+        let fast = report.result(Variant::WhisperVulkan).unwrap();
+        assert_eq!(fast.runs_secs, vec![0.10]);
+        assert_eq!(fast.word_error_rate, Some(0.0));
+        assert!(report
+            .result(Variant::WhisperNative)
+            .unwrap()
+            .stopped
+            .is_some());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            BenchEvent::Stopped {
+                variant: Variant::WhisperNative,
+                faster: Variant::WhisperVulkan,
+                ..
+            }
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_variant_is_reported_not_recommended() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(
+            dir.path(),
+            Variant::WhisperNative,
+            "echo 'model not found' >&2\nexit 3",
+        );
+        let input = fake_input(dir.path(), vec![Variant::WhisperNative]);
+        let report = run_benchmark(&input, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let native = report.result(Variant::WhisperNative).unwrap();
+        assert!(native.error.as_deref().unwrap().contains("model not found"));
+        assert_eq!(report.recommended, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_benchmark_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_variant(dir.path(), Variant::WhisperNative, "exec sleep 30");
+        let input = fake_input(dir.path(), vec![Variant::WhisperNative]);
+        let start = Instant::now();
+        let result = run_benchmark(&input, &mut |_| {}, &AtomicBool::new(true));
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

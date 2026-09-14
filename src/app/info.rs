@@ -386,6 +386,27 @@ fn print_variants_text(inv: &setup::binary::Inventory) {
             inv.recommendation.onnx.display(),
             inv.recommendation.onnx_reason
         );
+        match setup::benchmark::load_report() {
+            Some(report) => {
+                let eligible = setup::benchmark::eligible(
+                    &setup::binary::enumerate_installed(),
+                    &inv.cpu,
+                    &inv.gpus,
+                    &report.engine,
+                );
+                match setup::benchmark::summary(&report, setup::benchmark::now_secs()) {
+                    Some(s) if report.is_stale(&eligible) => println!(
+                        "  Measured:      {}  (installed builds changed; rerun voxtype setup benchmark)",
+                        s
+                    ),
+                    Some(s) => println!("  Measured:      ★ {}", s),
+                    None => println!(
+                        "  Measured:      no usable result; rerun voxtype setup benchmark"
+                    ),
+                }
+            }
+            None => println!("  Measured:      not yet; run voxtype setup benchmark"),
+        }
     }
 
     println!();

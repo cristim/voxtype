@@ -197,6 +197,12 @@ pub enum SetupAction {
         /// Print the results as JSON
         #[arg(long)]
         json: bool,
+
+        /// Internal: record until a line arrives on stdin, write the WAV here,
+        /// and exit. `voxtype configure` records through this so audio device
+        /// access stays out of the TUI process.
+        #[arg(long, value_name = "FILE", hide = true)]
+        record_to: Option<std::path::PathBuf>,
     },
 
     /// Hidden alias for 'onnx' (backwards compatibility)
@@ -599,6 +605,7 @@ mod tests {
                         runs,
                         save_audio,
                         json,
+                        record_to,
                     }),
                 ..
             }) => {
@@ -606,6 +613,7 @@ mod tests {
                 assert_eq!(runs, 5);
                 assert_eq!(save_audio, None);
                 assert!(json);
+                assert_eq!(record_to, None, "recording child mode is off by default");
             }
             _ => panic!("Expected Setup Benchmark command"),
         }

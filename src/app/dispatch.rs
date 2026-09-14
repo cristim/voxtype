@@ -348,6 +348,7 @@ pub(crate) async fn dispatch(
                     runs,
                     save_audio,
                     json,
+                    record_to,
                 }) => {
                     warn_if_root("benchmark");
                     setup::benchmark::run(
@@ -357,6 +358,7 @@ pub(crate) async fn dispatch(
                         runs,
                         save_audio,
                         json,
+                        record_to,
                     )
                     .await?;
                 }

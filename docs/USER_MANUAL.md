@@ -245,7 +245,9 @@ voxtype setup gpu --disable  # Switch back to CPU backend (requires sudo)
 
 ### `voxtype setup benchmark`
 
-Measure the installed binary variants on your own machine and recommend one. Voxtype shows a short passage, records you reading it, then transcribes the recording with every installed variant that can run your configured engine on this CPU and GPU. Each variant gets one warm-up run and then timed runs, and the recommendation is the fastest variant whose word error rate is within 5 points of the most accurate one, so a GPU build that finishes quickly with the wrong words is not picked.
+Measure the installed binary variants on your own machine and recommend one. Voxtype shows a short passage, records you reading it, then transcribes the recording with every installed variant that can run your configured engine on this CPU and GPU. Each variant gets one warm-up run and then timed runs, starting with the hardware recommendation. A variant that is already slower than an accurate one is stopped instead of waited for. The recommendation is the fastest variant whose word error rate is within 5 points of the most accurate one, so a GPU build that finishes quickly with the wrong words is not picked.
+
+Results are saved to `~/.local/state/voxtype/benchmark.json`. `voxtype info variants` shows them as a "Measured" line, and in `voxtype configure` the General screen stars the measured pick in the variant matrix (until the installed builds change). Press `b` on the General screen to run the same benchmark from inside the TUI, then Enter on the results to switch to the recommended variant.
 
 ```bash
 voxtype setup benchmark                             # Record the passage and benchmark

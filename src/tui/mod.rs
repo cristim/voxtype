@@ -7,6 +7,7 @@
 mod advanced_section;
 mod app;
 mod audio;
+mod benchmark_screen;
 mod common;
 mod compositor_bindings;
 mod config_editor;
@@ -320,6 +321,11 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         return Some(handle_quit_prompt_key(app, key));
     }
 
+    // Benchmark screen: owns every key while it is open.
+    if app.benchmark.is_some() {
+        return Some(benchmark_screen::handle_key(app, key));
+    }
+
     // Help overlay: any key dismisses it (including ?).
     if app.help_open {
         app.help_open = false;
@@ -385,7 +391,7 @@ fn handle_sidebar_key(app: &mut App, key: KeyEvent) -> Action {
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     // Ignore mouse input while help overlay is open or a text field is editing.
-    if app.help_open || app.is_editing() {
+    if app.help_open || app.is_editing() || app.benchmark.is_some() {
         return;
     }
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -461,6 +467,9 @@ fn draw(f: &mut Frame, app: &App) {
 
     render_footer(f, outer[3], app);
 
+    if let Some(screen) = &app.benchmark {
+        benchmark_screen::render(f, screen, app);
+    }
     if app.help_open {
         render_help_overlay(f);
     }
@@ -552,6 +561,7 @@ fn render_help_overlay(f: &mut Frame) {
         Line::from("  ↑↓←→ / hjkl Navigate variant matrix"),
         Line::from("  Enter        Switch to variant under cursor"),
         Line::from("  D            Start or restart the voxtype daemon"),
+        Line::from("  b            Benchmark the installed builds on this machine"),
         Line::from("  r            Refresh inventory"),
         Line::from(""),
         Line::from(Span::styled("Section forms", bold)),
@@ -685,7 +695,7 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         ])
     } else {
         let section_keys = match app.current_section {
-            Section::General => " D start/restart daemon · r refresh ",
+            Section::General => " b benchmark · D start/restart daemon · r refresh ",
             _ => " s save · r revert ",
         };
         Line::from(Span::styled(
