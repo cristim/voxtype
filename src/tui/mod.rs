@@ -343,6 +343,12 @@ fn handle_global_key(app: &mut App, key: KeyEvent) -> Option<Action> {
         // lives. Mentioned in the variant-mismatch banner so a user landing
         // on (say) Audio can fix the engine/binary mismatch without
         // navigating the sidebar by hand. See #450.
+        // `b` opens the benchmark from General whether the sidebar or the
+        // content pane has focus; the TUI starts with the sidebar focused.
+        (KeyCode::Char('b'), KeyModifiers::NONE) if app.current_section == Section::General => {
+            app.open_benchmark();
+            Some(Action::None)
+        }
         (KeyCode::F(2), _) => {
             app.jump_to_section(Section::General);
             Some(Action::None)

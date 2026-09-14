@@ -497,6 +497,18 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// The TUI opens with the sidebar focused; `b` must still start the
+    /// benchmark from General instead of being swallowed by the sidebar.
+    #[test]
+    fn b_opens_the_benchmark_with_the_sidebar_focused() {
+        let mut app = App::new(false);
+        app.current_section = super::super::section::Section::General;
+        app.sidebar_focused = true;
+        let action = super::super::handle_global_key(&mut app, key(KeyCode::Char('b')));
+        assert!(matches!(action, Some(Action::None)));
+        assert!(app.benchmark.is_some());
+    }
+
     #[test]
     fn escape_closes_the_screen() {
         let mut app = App::new(false);
