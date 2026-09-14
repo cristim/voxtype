@@ -243,6 +243,20 @@ voxtype setup gpu --enable   # Switch to Vulkan GPU backend (requires sudo)
 voxtype setup gpu --disable  # Switch back to CPU backend (requires sudo)
 ```
 
+### `voxtype setup benchmark`
+
+Measure the installed binary variants on your own machine and recommend one. Voxtype shows a short passage, records you reading it, then transcribes the recording with every installed variant that can run your configured engine on this CPU and GPU. Each variant gets one warm-up run and then timed runs, and the recommendation is the fastest variant whose word error rate is within 5 points of the most accurate one, so a GPU build that finishes quickly with the wrong words is not picked.
+
+```bash
+voxtype setup benchmark                             # Record the passage and benchmark
+voxtype setup benchmark --runs 5                    # More timed runs per variant
+voxtype setup benchmark --save-audio take.wav       # Keep the recording
+voxtype setup benchmark --audio take.wav            # Reuse a WAV instead of recording (accuracy not scored)
+voxtype setup benchmark --json                      # Machine-readable results
+```
+
+Nothing is switched. The report prints the command to switch to the recommended variant. Timings are only as good as the machine is idle: the benchmark warns when the system load is high or the daemon is running.
+
 ### `voxtype setup dms`
 
 Install a status widget for DankMaterialShell (KDE Plasma alternative shell).
